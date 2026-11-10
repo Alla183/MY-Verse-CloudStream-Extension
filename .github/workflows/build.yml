@@ -1,0 +1,238 @@
+name: Build
+
+permissions:
+  contents: write
+
+concurrency:
+  group: "build"
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '*.md'
+
+  workflow_run:
+    workflows: ["Sync Upstream"]
+    types:
+      - completed
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ========================================
+      # Checkout source
+      # ========================================
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: "src"
+
+      # ========================================
+      # Checkout builds branch
+      # IMPORTANT: DO NOT DELETE OLD FILES
+      # ========================================
+      - name: Checkout builds
+        uses: actions/checkout@v4
+        with:
+          ref: "builds"
+          path: "builds"
+
+      # ========================================
+      # Setup Java
+      # ========================================
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # ========================================
+      # Setup Gradle
+      # ========================================
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      # ========================================
+      # Build plugins
+      # ========================================
+      - name: Build Plugins
+        run: |
+          cd "$GITHUB_WORKSPACE/src"
+
+          touch local.properties
+          chmod +x gradlew
+
+          echo "========================================"
+          echo "BUILDING PLUGINS"
+          echo "========================================"
+
+          ./gradlew clean make makePluginsJson --continue
+
+          echo "========================================"
+          echo "BUILT CS3 FILES"
+          echo "========================================"
+
+          find "$GITHUB_WORKSPACE/src" \
+            -type f \
+            -name "*.cs3" \
+            -print | sort
+
+      # ========================================
+      # Copy generated CS3 files
+      # ========================================
+      - name: Copy CS3 packages
+        run: |
+          echo "========================================"
+          echo "COPYING CS3 FILES"
+          echo "========================================"
+
+          find "$GITHUB_WORKSPACE/src" \
+            -type f \
+            -name "*.cs3" \
+            -exec cp -f {} "$GITHUB_WORKSPACE/builds/" \;
+
+      # ========================================
+      # Copy plugins.json
+      # ========================================
+      - name: Copy plugins.json
+        run: |
+          echo "========================================"
+          echo "COPYING plugins.json"
+          echo "========================================"
+
+          test -f "$GITHUB_WORKSPACE/src/build/plugins.json"
+
+          cp -f \
+            "$GITHUB_WORKSPACE/src/build/plugins.json" \
+            "$GITHUB_WORKSPACE/builds/plugins.json"
+
+      # ========================================
+      # Create repo.json
+      # ========================================
+      - name: Create repo.json
+        run: |
+          cat > "$GITHUB_WORKSPACE/builds/repo.json" <<'EOF'
+          {
+            "name": "My-Verse",
+            "description": "My Verse CloudStream Extensions",
+            "manifestVersion": 1,
+            "pluginLists": [
+              "https://raw.githubusercontent.com/Alla183/MY-Verse-CloudStream-Extension/builds/plugins.json"
+            ]
+          }
+          EOF
+
+          echo "========================================"
+          echo "repo.json"
+          echo "========================================"
+
+          cat "$GITHUB_WORKSPACE/builds/repo.json"
+
+      # ========================================
+      # Verify everything BEFORE push
+      # ========================================
+      - name: Verify build
+        run: |
+          echo "========================================"
+          echo "BUILD DIRECTORY"
+          echo "========================================"
+
+          find "$GITHUB_WORKSPACE/builds" \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' | sort
+
+          echo "========================================"
+          echo "CHECK HDrezkaProvider.cs3"
+          echo "========================================"
+
+          test -f \
+            "$GITHUB_WORKSPACE/builds/HDrezkaProvider.cs3"
+
+          echo "HDrezkaProvider.cs3 FOUND!"
+
+          echo "========================================"
+          echo "CHECK plugins.json"
+          echo "========================================"
+
+          test -f \
+            "$GITHUB_WORKSPACE/builds/plugins.json"
+
+          grep -q "HDrezkaProvider" \
+            "$GITHUB_WORKSPACE/builds/plugins.json"
+
+          echo "HDrezkaProvider FOUND IN plugins.json!"
+
+          echo "========================================"
+          echo "CHECK repo.json"
+          echo "========================================"
+
+          test -f \
+            "$GITHUB_WORKSPACE/builds/repo.json"
+
+          grep -q "plugins.json" \
+            "$GITHUB_WORKSPACE/builds/repo.json"
+
+          echo "repo.json FOUND!"
+
+          echo "========================================"
+          echo "CHECK OLD PLUGINS"
+          echo "========================================"
+
+          test -f "$GITHUB_WORKSPACE/builds/TamilDhoolProvider.cs3" || true
+          test -f "$GITHUB_WORKSPACE/builds/CastleTvProvider.cs3" || true
+          test -f "$GITHUB_WORKSPACE/builds/XonProvider.cs3" || true
+
+          echo "Old plugin files preserved."
+
+      # ========================================
+      # Show git changes
+      # ========================================
+      - name: Show changes
+        run: |
+          cd "$GITHUB_WORKSPACE/builds"
+
+          echo "========================================"
+          echo "GIT STATUS"
+          echo "========================================"
+
+          git status --short
+
+      # ========================================
+      # Push builds
+      # ========================================
+      - name: Push builds
+        run: |
+          cd "$GITHUB_WORKSPACE/builds"
+
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+
+          git add .
+
+          echo "========================================"
+          echo "STAGED CHANGES"
+          echo "========================================"
+
+          git status --short
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Build $GITHUB_SHA"
+
+          git push origin builds
+
+          echo "========================================"
+          echo "BUILD BRANCH PUSHED SUCCESSFULLY"
+          echo "========================================"
+
