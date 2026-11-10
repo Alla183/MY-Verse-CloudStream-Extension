@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://dorama.land/favicon.ico",
-        "fileHash": "sha256-d6c8e75903bd7e333119ffeecfa5952cf49f8c7c8797d9b47460240981fe4394",
+        "fileHash": "sha256-1623f0eb214868d07b7ff60a36c5dd2e86cb95b1c131e9c9e75ebaa47000adeb",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Alla183/MY-Verse-CloudStream-Extension",
-        "fileSize": 29319,
+        "fileSize": 29529,
         "status": 1,
         "language": "uk",
         "authors": [
@@ -14,7 +14,7 @@
             "TvSeries",
             "AsianDrama"
         ],
-        "version": 28,
+        "version": 29,
         "internalName": "DoramaLandProviders",
         "description": "DoramaLand - Doramas",
         "url": "https://raw.githubusercontent.com/Alla183/MY-Verse-CloudStream-Extension/builds/DoramaLandProviders.cs3",
