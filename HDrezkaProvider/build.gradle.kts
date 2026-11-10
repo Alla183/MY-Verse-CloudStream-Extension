@@ -8,11 +8,11 @@ android {
 } 
 
 cloudstream {
-    language = "ru"
+    language = "ua"
     // All of these properties are optional, you can safely remove them
 
     // description = "Lorem Ipsum"
-     authors = listOf("Hexated, NivinCNC", "me")
+     authors = listOf("Hexated, NivinCNC", "Alla183")
 
     /**
      * Status int as the following:
