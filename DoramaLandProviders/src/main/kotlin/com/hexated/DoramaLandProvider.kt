@@ -31,57 +31,14 @@ class DoramaLandProvider : MainAPI() {
         "$mainUrl/api/v2/html/serials?status_id=2" to "Очікуване"
     )
 
-    
-
-    private fun parseCatalogElement(el: Element): SearchResponse? {
-        val title = el.selectFirst(".catalog-item__title")?.text() ?: return null
-        val href = fixUrl(el.selectFirst("a")?.attr("href") ?: return null)
-
-        val img = el.selectFirst("img")
-        val src = img?.attr("src")?.trim()
-        val dataSrc = img?.attr("data-src")?.trim()
-        val srcset = img?.attr("srcset")?.trim()
-        val dataSrcSet = img?.attr("data-srcset")?.trim()
-
-        val posterRaw = when {
-            !dataSrc.isNullOrEmpty() -> dataSrc
-            !src.isNullOrEmpty() -> src
-            !dataSrcSet.isNullOrEmpty() -> dataSrcSet.split(" ").firstOrNull()
-            !srcset.isNullOrEmpty() -> srcset.split(" ").firstOrNull()
-            else -> null
-        }
-        val poster = posterRaw?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-
-        return if (el.selectFirst(".cinema-type-label.film") != null) {
-            newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = poster }
-        } else {
-            newTvSeriesSearchResponse(title, href, TvType.AsianDrama) { this.posterUrl = poster }
-        }
-    }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-    // ===== API-секції =====
+    // ===== API-секції (Усі дорами, Фільми, Прем'єри, Очікуване) =====
         if (request.data.contains("/api/v2/")) {
-            val anchor = request.data.substringAfter("#", "")      // premieres / expected / ""
-            val apiData = request.data.substringBefore("#")
-
-        // старий список з головної (для Прем'єр і Очікуваного)
-            val oldItems: List<SearchResponse> = if (anchor.isNotEmpty()) {
-                try {
-                    app.get(mainUrl).document
-                        .select("#$anchor .catalog-item")
-                        .mapNotNull { parseCatalogElement(it) }
-                } catch (e: Exception) {
-                    emptyList()
-                }
-            } else emptyList()
-            val oldUrls = oldItems.map { it.url }.toSet()
-
             val limit = 20
             val offset = (page - 1) * limit
 
             val year = Calendar.getInstance().get(Calendar.YEAR)
-            val baseUrl = apiData.replace("{year}", year.toString())
+            val baseUrl = request.data.replace("{year}", year.toString())
             val sep = if (baseUrl.contains("?")) "&" else "?"
 
             val text = app.get(
@@ -106,7 +63,6 @@ class DoramaLandProvider : MainAPI() {
                     if (title.isEmpty() || urlPath.isEmpty()) continue
 
                     val href = fixUrl(urlPath)
-                    if (href in oldUrls) continue   // вже є у старому списку
 
                     val posterObj = item.optJSONObject("poster")
                     val posterPath = posterObj?.optString("x2")?.takeIf { it.isNotEmpty() }
@@ -126,9 +82,9 @@ class DoramaLandProvider : MainAPI() {
             }
 
             val hasNext = offset + (arr?.length() ?: 0) < total
-            val result = if (page == 1) oldItems + list else list
-            return newHomePageResponse(request.name, result, hasNext)
+            return newHomePageResponse(request.name, list, hasNext)
         }
+    // ===== кінець API-секцій =====
 
     // ===== HTML-секція (Популярне) =====
         val url = request.data
@@ -145,10 +101,46 @@ class DoramaLandProvider : MainAPI() {
             else -> doc.select("div.catalog-item.catalog-item_type_poster")
         }
 
-        val home = items.mapNotNull { parseCatalogElement(it) }
+        val home = items.mapNotNull { el ->
+
+            val title = el.selectFirst(".catalog-item__title")?.text() ?: return@mapNotNull null
+            val href = fixUrl(el.selectFirst("a")?.attr("href") ?: return@mapNotNull null)
+
+            val img = el.selectFirst("img")
+            val src = img?.attr("src")?.trim()
+            val dataSrc = img?.attr("data-src")?.trim()
+            val srcset = img?.attr("srcset")?.trim()
+            val dataSrcSet = img?.attr("data-srcset")?.trim()
+
+            val posterRaw = when {
+                !dataSrc.isNullOrEmpty() -> dataSrc
+                !src.isNullOrEmpty() -> src
+                !dataSrcSet.isNullOrEmpty() -> dataSrcSet.split(" ").firstOrNull()
+                !srcset.isNullOrEmpty() -> srcset.split(" ").firstOrNull()
+                else -> null
+            }
+
+            val poster = posterRaw?.let {
+                if (it.startsWith("http")) it else "$mainUrl$it"
+            }
+
+            val isMovie = el.selectFirst(".cinema-type-label.film") != null
+
+            if (isMovie) {
+                newMovieSearchResponse(title, href, TvType.Movie) {
+                    this.posterUrl = poster
+                }
+            } else {
+                newTvSeriesSearchResponse(title, href, TvType.AsianDrama) {
+                    this.posterUrl = poster
+                }
+            }
+        }
 
         return newHomePageResponse(request.name, home)
     }
+
+    
 
     override suspend fun search(query: String): List<SearchResponse> {
         println("=== SEARCH START === $query")
