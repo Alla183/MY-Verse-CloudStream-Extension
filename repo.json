@@ -1,6 +1,7 @@
 {
   "name": "My-Verse",
   "description": "My Verse CloudStream Extensions",
+  "iconUrl": "https://raw.githubusercontent.com/Alla183/MY-Verse-CloudStream-Extension/main/icon.png",
   "manifestVersion": 1,
   "pluginLists": [
     "https://raw.githubusercontent.com/Alla183/MY-Verse-CloudStream-Extension/builds/plugins.json"
