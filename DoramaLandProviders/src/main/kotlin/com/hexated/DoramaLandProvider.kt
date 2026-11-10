@@ -25,22 +25,22 @@ class DoramaLandProvider : MainAPI() {
     override val hasMainPage = true
     override val mainPage = mainPageOf(
         "$mainUrl/api/v2/html/serials" to "Усі дорами",
-        "$mainUrl/api/v2/html/serials?tag_id=222&order=popular" to "Фільми",
+        "$mainUrl/tags/doramy-filmy-af" to "Фільми",
         "$mainUrl/#popular" to "Популярне",
         "$mainUrl/api/v2/html/serials?min_year={year}&max_year={year}" to "Прем'єри",
         "$mainUrl/api/v2/html/serials?status_id=2" to "Очікуване"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-
-        // ===== API-секції (Усі дорами, Фільми, Прем'єри, Очікуване) =====
+        // ===== API-секції (Прем'єри, Очікуване) =====
         if (request.data.contains("/api/v2/")) {
             val limit = 20
             val offset = (page - 1) * limit
-            val sep = if (request.data.contains("?")) "&" else "?"
 
+            val year = Calendar.getInstance().get(Calendar.YEAR)
+            val baseUrl = request.data.replace("{year}", year.toString())
             val text = app.get(
-                "${request.data}${sep}limit=$limit&offset=$offset",
+                "$baseUrl&limit=$limit&offset=$offset",
                 headers = mapOf(
                     "Referer" to mainUrl,
                     "X-Requested-With" to "XMLHttpRequest"
@@ -57,10 +57,8 @@ class DoramaLandProvider : MainAPI() {
                     val item = arr.getJSONObject(i)
 
                     val title = item.optString("name")
-                    val urlPath = item.optString("url")
-                    if (title.isEmpty() || urlPath.isEmpty()) continue
-
-                    val href = fixUrl(urlPath)
+                    val href = fixUrl(item.optString("url"))
+                    if (title.isEmpty() || item.optString("url").isEmpty()) continue
 
                     val posterObj = item.optJSONObject("poster")
                     val posterPath = posterObj?.optString("x2")?.takeIf { it.isNotEmpty() }
@@ -82,23 +80,26 @@ class DoramaLandProvider : MainAPI() {
             val hasNext = offset + (arr?.length() ?: 0) < total
             return newHomePageResponse(request.name, list, hasNext)
         }
-        // ===== кінець API-секцій =====
-
-        // ===== HTML-секція (Популярне) =====
+            // ===== кінець API-секцій =====
         val url = request.data
         val cleanUrl = url.substringBefore("#")
+        val isAnchor = url.contains("#")
 
-        // у "Популярного" наступних сторінок немає
-        if (url.contains("#") && page > 1) {
+        if (isAnchor && page > 1) {
             return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
         }
 
-        val doc = app.get(cleanUrl).document
+        val sep = if (cleanUrl.contains("?")) "&" else "?"
+        val pageUrl = if (page > 1) "$cleanUrl${sep}page=$page" else cleanUrl
+        val doc = app.get(pageUrl).document
 
         val items = when {
             url.contains("#popular") -> doc.select("#popular .catalog-item")
+            url.contains("doramy-filmy") -> doc.select(".catalog-item")
             else -> doc.select("div.catalog-item.catalog-item_type_poster")
         }
+
+        val isMoviesPage = url.contains("doramy-filmy")
 
         val home = items.mapNotNull { el ->
 
@@ -123,7 +124,8 @@ class DoramaLandProvider : MainAPI() {
                 if (it.startsWith("http")) it else "$mainUrl$it"
             }
 
-            val isMovie = el.selectFirst(".cinema-type-label.film") != null
+        // на сторінці фільмів усе вважаємо фільмами
+            val isMovie = isMoviesPage || el.selectFirst(".cinema-type-label.film") != null
 
             if (isMovie) {
                 newMovieSearchResponse(title, href, TvType.Movie) {
