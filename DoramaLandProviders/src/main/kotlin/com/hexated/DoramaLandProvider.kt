@@ -26,7 +26,7 @@ class DoramaLandProvider : MainAPI() {
         "$mainUrl/all-dramas" to "Усі дорами",
         "$mainUrl/tags/doramy-filmy-af" to "Фільми",
         "$mainUrl/#popular" to "Популярне",
-        "$mainUrl/api/v2/html/serials?min_year=2026&max_year=2026" to "Прем'єри",
+        "$mainUrl/api/v2/html/serials?min_year={year}&max_year={year}" to "Прем'єри",
         "$mainUrl/api/v2/html/serials?status_id=2" to "Очікуване"
     )
 
@@ -36,8 +36,10 @@ class DoramaLandProvider : MainAPI() {
             val limit = 20
             val offset = (page - 1) * limit
 
+            val year = Calendar.getInstance().get(Calendar.YEAR)
+            val baseUrl = request.data.replace("{year}", year.toString())
             val text = app.get(
-                "${request.data}&limit=$limit&offset=$offset",
+                "$baseUrl&limit=$limit&offset=$offset",
                 headers = mapOf(
                     "Referer" to mainUrl,
                     "X-Requested-With" to "XMLHttpRequest"
