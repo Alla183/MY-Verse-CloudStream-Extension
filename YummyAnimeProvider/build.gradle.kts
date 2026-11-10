@@ -7,7 +7,7 @@ android {
 }
 
 cloudstream {
-    language = "ru"
+    language = "ua"
 
     authors = listOf("Alla183")
     status = 1 // will be 3 if unspecified
