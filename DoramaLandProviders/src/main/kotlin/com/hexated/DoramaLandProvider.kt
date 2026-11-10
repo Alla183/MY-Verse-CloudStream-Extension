@@ -26,8 +26,8 @@ class DoramaLandProvider : MainAPI() {
         "$mainUrl/all-dramas" to "Усі дорами",
         "$mainUrl/tags/doramy-filmy-af" to "Фільми",
         "$mainUrl/#popular" to "Популярне",
-        "$mainUrl/dramas-online?year=2026" to "Прем'єри",
-        "$mainUrl/dramas-online?status_id=2" to "Очікуване"
+        "$mainUrl/api/v2/html/serials?min_year=2026&max_year=2026" to "Прем'єри",
+        "$mainUrl/api/v2/html/serials?status_id=2" to "Очікуване"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
