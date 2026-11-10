@@ -44,7 +44,10 @@ class YummyAnimeProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val url = "$catalogBase${request.data}?page=$page"
+        val sep = if (request.data.contains("?")) "&" else "?"
+        val url = "$catalogBase${request.data}${sep}page=$page"
+        println("YUMMY MAIN url=$url")
+
         val doc = app.get(url).document
 
         val list = doc.select("div.anime-column").mapNotNull { element ->
@@ -57,19 +60,18 @@ class YummyAnimeProvider : MainAPI() {
 
             newAnimeSearchResponse(
                 title,
-                "https://site.yummyani.me/catalog/item/$slug",
+                "$mainUrl/catalog/item/$slug",
                 TvType.Anime
             ) {
                 posterUrl = if (poster.startsWith("//")) "https:$poster" else fixUrl(poster)
             }
         }
 
-        return newHomePageResponse(
-            listOf(HomePageList(request.name, list)),
-            list.isNotEmpty()
-        )
-    }
+    // Є наступна сторінка, лише якщо в пагінації є стрілка "next"
+        val hasNext = doc.selectFirst("ul.pagination a[rel=next]") != null
 
+        return newHomePageResponse(request, list, hasNext)
+    }
 
     data class AnimeItem(
         @JsonProperty("title") val title: String? = null,
