@@ -66,10 +66,10 @@
     },
     {
         "iconUrl": "https://site.yummyani.me/favicon.ico",
-        "fileHash": "sha256-b401118f71834c6334e80216357f11ae6c35b3bf9daa3accbeea5d799cd82f74",
+        "fileHash": "sha256-0ddc4c68512aed99226718e39e8db54d8e249b21e85a9d5d54bb9a968152d923",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Alla183/MY-Verse-CloudStream-Extension",
-        "fileSize": 44767,
+        "fileSize": 44954,
         "status": 1,
         "language": "uk",
         "authors": [
