@@ -17,7 +17,8 @@ class DoramaLandProvider : MainAPI() {
 
     override val supportedTypes = setOf(
         TvType.TvSeries,
-        TvType.AsianDrama
+        TvType.AsianDrama,
+        TvType.Movie 
     )
 
     override val hasMainPage = true
