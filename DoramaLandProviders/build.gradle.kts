@@ -1,4 +1,4 @@
-version = 30
+version = 29
 
 cloudstream {
     language = "uk"
