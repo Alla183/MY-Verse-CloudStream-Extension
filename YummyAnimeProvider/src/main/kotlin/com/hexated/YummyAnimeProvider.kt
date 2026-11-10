@@ -67,6 +67,10 @@ class YummyAnimeProvider : MainAPI() {
             }
         }
 
+        val nextHref = doc.selectFirst("ul.pagination a[rel=next]")?.attr("href")
+        val activePage = doc.selectFirst("ul.pagination li.active")?.text()
+        println("YUMMY MAIN count=${list.size} first=${list.firstOrNull()?.url} last=${list.lastOrNull()?.url} active=$activePage next=$nextHref")
+
     // Є наступна сторінка, лише якщо в пагінації є стрілка "next"
         val hasNext = doc.selectFirst("ul.pagination a[rel=next]") != null
 
