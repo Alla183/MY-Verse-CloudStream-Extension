@@ -22,10 +22,10 @@
     },
     {
         "iconUrl": "https://www.google.com/s2/favicons?domain=rezka.ag&sz=%size%",
-        "fileHash": "sha256-4b77245791b3f7cbd1daa42d0cf1005c5aa2608dfc4772af8d13d0e8dfe5ce05",
+        "fileHash": "sha256-8a91b01f8ca8eaaf67d6bfffae922607c205a832dba3b5d263417406bb33d027",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Alla183/MY-Verse-CloudStream-Extension",
-        "fileSize": 55566,
+        "fileSize": 55572,
         "status": 1,
         "language": "uk",
         "authors": [
@@ -66,10 +66,10 @@
     },
     {
         "iconUrl": "https://site.yummyani.me/favicon.ico",
-        "fileHash": "sha256-d4b5228fbcf214b637c2df10c866096c99e3951a2a731d29f449d21d5096b8c3",
+        "fileHash": "sha256-2c698303dc5828409bfcfdb08d03d6ee50748107cd395ec711afc883f83cfbcf",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Alla183/MY-Verse-CloudStream-Extension",
-        "fileSize": 45123,
+        "fileSize": 45124,
         "status": 1,
         "language": "uk",
         "authors": [
