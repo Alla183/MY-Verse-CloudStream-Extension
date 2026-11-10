@@ -31,31 +31,7 @@ class DoramaLandProvider : MainAPI() {
         "$mainUrl/api/v2/html/serials?status_id=2#expected" to "Очікуване"
     )
 
-    private fun parseCatalogElement(el: Element): SearchResponse? {
-        val title = el.selectFirst(".catalog-item__title")?.text() ?: return null
-        val href = fixUrl(el.selectFirst("a")?.attr("href") ?: return null)
-
-        val img = el.selectFirst("img")
-        val src = img?.attr("src")?.trim()
-        val dataSrc = img?.attr("data-src")?.trim()
-        val srcset = img?.attr("srcset")?.trim()
-        val dataSrcSet = img?.attr("data-srcset")?.trim()
-
-        val posterRaw = when {
-            !dataSrc.isNullOrEmpty() -> dataSrc
-            !src.isNullOrEmpty() -> src
-            !dataSrcSet.isNullOrEmpty() -> dataSrcSet.split(" ").firstOrNull()
-            !srcset.isNullOrEmpty() -> srcset.split(" ").firstOrNull()
-            else -> null
-        }
-        val poster = posterRaw?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-
-        return if (el.selectFirst(".cinema-type-label.film") != null) {
-            newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = poster }
-        } else {
-            newTvSeriesSearchResponse(title, href, TvType.AsianDrama) { this.posterUrl = poster }
-        }
-    }
+    
 
     private fun parseCatalogElement(el: Element): SearchResponse? {
         val title = el.selectFirst(".catalog-item__title")?.text() ?: return null
