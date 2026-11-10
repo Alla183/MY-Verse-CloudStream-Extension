@@ -27,7 +27,7 @@ class YummyAnimeProvider : MainAPI() {
     // =========================
 
     // База для каталогу. Якщо розділи порожні на site.* — змінити на "https://old.yummyani.me"
-    private val catalogBase = "https://site.yummyani.me"
+//    private val catalogBase = "https://site.yummyani.me"
 
     override val mainPage = mainPageOf(
         "/catalog" to "Усі аніме",
@@ -40,41 +40,49 @@ class YummyAnimeProvider : MainAPI() {
         "/catalog/category/detektiv" to "Детектив"
     )
 
+    private val catalogBase = "https://old.yummyani.me"
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val sep = if (request.data.contains("?")) "&" else "?"
-        val url = "$catalogBase${request.data}${sep}page=$page"
+        val url = "$catalogBase${request.data}?sort=name&page=$page"
         println("YUMMY MAIN url=$url")
 
-        val doc = app.get(url).document
+        return try {
+            val doc = app.get(url).document
+            println("YUMMY MAIN html len=${doc.html().length} columns=${doc.select("div.anime-column").size}")
 
-        val list = doc.select("div.anime-column").mapNotNull { element ->
-            val href = element.selectFirst("a.image-block")?.attr("href") ?: return@mapNotNull null
-            val slug = href.substringBefore("?").trimEnd('/').substringAfterLast("/")
-            if (slug.isBlank()) return@mapNotNull null
+            val list = doc.select("div.anime-column").mapNotNull { element ->
+                val href = element.selectFirst("a.image-block")?.attr("href") ?: return@mapNotNull null
+                val slug = href.substringBefore("?").trimEnd('/').substringAfterLast("/")
+                if (slug.isBlank()) return@mapNotNull null
 
-            val poster = element.selectFirst("img")?.attr("src") ?: ""
-            val title = element.selectFirst(".anime-title")?.text() ?: return@mapNotNull null
+                val poster = element.selectFirst("img")?.attr("src") ?: ""
+                val title = element.selectFirst(".anime-title")?.text() ?: return@mapNotNull null
 
-            newAnimeSearchResponse(
-                title,
-                "$mainUrl/catalog/item/$slug",
-                TvType.Anime
-            ) {
-                posterUrl = if (poster.startsWith("//")) "https:$poster" else fixUrl(poster)
+                newAnimeSearchResponse(
+                    title,
+                    "https://site.yummyani.me/catalog/item/$slug",
+                    TvType.Anime
+                ) {
+                    posterUrl = when {
+                        poster.startsWith("//") -> "https:$poster"
+                        poster.startsWith("/") -> "$catalogBase$poster"
+                        else -> poster
+                    }
+                }
             }
+
+            val nextHref = doc.selectFirst("ul.pagination a[rel=next]")?.attr("href")
+            val activePage = doc.selectFirst("ul.pagination li.active")?.text()
+            println("YUMMY MAIN count=${list.size} first=${list.firstOrNull()?.url} active=$activePage next=$nextHref")
+
+            newHomePageResponse(request, list, nextHref != null)
+        } catch (e: Exception) {
+            println("YUMMY MAIN ERROR: ${e::class.java.simpleName}: ${e.message}")
+            newHomePageResponse(request, emptyList(), false)
         }
-
-        val nextHref = doc.selectFirst("ul.pagination a[rel=next]")?.attr("href")
-        val activePage = doc.selectFirst("ul.pagination li.active")?.text()
-        println("YUMMY MAIN count=${list.size} first=${list.firstOrNull()?.url} last=${list.lastOrNull()?.url} active=$activePage next=$nextHref")
-
-    // Є наступна сторінка, лише якщо в пагінації є стрілка "next"
-        val hasNext = doc.selectFirst("ul.pagination a[rel=next]") != null
-
-        return newHomePageResponse(request, list, hasNext)
     }
 
     data class AnimeItem(
