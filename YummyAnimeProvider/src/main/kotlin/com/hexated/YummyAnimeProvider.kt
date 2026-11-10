@@ -30,10 +30,11 @@ class YummyAnimeProvider : MainAPI() {
 //    private val catalogBase = "https://site.yummyani.me"
 
     override val mainPage = mainPageOf(
+        "catalog/category/senen-aj" to "Шьонен-ай"
         "/catalog" to "Усі аніме",
         "/catalog/ongoing" to "Онґоїнги",
         "/catalog/announcement" to "Анонси",
-        "/catalog/category/komediya" to "Комедії",
+        "/catalog/category/komediya" to "Комедія",
         "/catalog/category/romantika" to "Романтика",
         "/catalog/category/fentezi" to "Фентезі",
         "/catalog/category/priklyucheniya" to "Пригоди",
