@@ -31,27 +31,68 @@ class DoramaLandProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // ===== API-секції (Прем'єри, Очікуване) =====
+        if (request.data.contains("/api/v2/")) {
+            val limit = 20
+            val offset = (page - 1) * limit
+
+            val text = app.get(
+                "${request.data}&limit=$limit&offset=$offset",
+                headers = mapOf(
+                    "Referer" to mainUrl,
+                    "X-Requested-With" to "XMLHttpRequest"
+                )
+            ).text
+
+            val json = JSONObject(text)
+            val total = json.optInt("total", 0)
+            val arr = json.optJSONArray("items")
+
+            val list = ArrayList<SearchResponse>()
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val item = arr.getJSONObject(i)
+
+                    val title = item.optString("name")
+                    val href = fixUrl(item.optString("url"))
+                    if (title.isEmpty() || item.optString("url").isEmpty()) continue
+
+                    val posterObj = item.optJSONObject("poster")
+                    val posterPath = posterObj?.optString("x2")?.takeIf { it.isNotEmpty() }
+                        ?: posterObj?.optString("x1")
+                    val poster = posterPath?.let { fixUrl(it) }
+
+                    if (item.optBoolean("is_film")) {
+                        list.add(newMovieSearchResponse(title, href, TvType.Movie) {
+                            this.posterUrl = poster
+                        })
+                    } else {
+                        list.add(newTvSeriesSearchResponse(title, href, TvType.AsianDrama) {
+                            this.posterUrl = poster
+                        })
+                    }
+                }
+            }
+
+            val hasNext = offset + (arr?.length() ?: 0) < total
+            return newHomePageResponse(request.name, list, hasNext)
+        }
+            // ===== кінець API-секцій =====
         val url = request.data
         val cleanUrl = url.substringBefore("#")
         val isAnchor = url.contains("#")
 
-    // для якорів (#popular тощо) наступних сторінок немає
         if (isAnchor && page > 1) {
             return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
         }
 
-        val pageUrl = if (page > 1) "$cleanUrl?page=$page" else cleanUrl
+        val sep = if (cleanUrl.contains("?")) "&" else "?"
+        val pageUrl = if (page > 1) "$cleanUrl${sep}page=$page" else cleanUrl
         val doc = app.get(pageUrl).document
 
         val items = when {
             url.contains("#popular") -> doc.select("#popular .catalog-item")
-            url.contains("#premieres") -> doc.select("#premieres .catalog-item")
-            url.contains("#expected") -> doc.select("#expected .catalog-item")
-
-        // 🎬 сторінка фільмів: беремо всі картки без фільтра
-            url.contains("doramy-filmy") ->
-                doc.select(".catalog-item")
-
+            url.contains("doramy-filmy") -> doc.select(".catalog-item")
             else -> doc.select("div.catalog-item.catalog-item_type_poster")
         }
 
