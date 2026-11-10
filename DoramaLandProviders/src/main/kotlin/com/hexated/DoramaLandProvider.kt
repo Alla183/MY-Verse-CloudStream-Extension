@@ -30,24 +30,31 @@ class DoramaLandProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-
         val url = request.data
         val cleanUrl = url.substringBefore("#")
+        val isAnchor = url.contains("#")
 
-        val doc = app.get("$cleanUrl?page=$page").document
+    // для якорів (#popular тощо) наступних сторінок немає
+        if (isAnchor && page > 1) {
+            return newHomePageResponse(request.name, emptyList<SearchResponse>(), false)
+        }
+
+        val pageUrl = if (page > 1) "$cleanUrl?page=$page" else cleanUrl
+        val doc = app.get(pageUrl).document
 
         val items = when {
             url.contains("#popular") -> doc.select("#popular .catalog-item")
             url.contains("#premieres") -> doc.select("#premieres .catalog-item")
             url.contains("#expected") -> doc.select("#expected .catalog-item")
 
-        // 🎬 тільки фільми
+        // 🎬 сторінка фільмів: беремо всі картки без фільтра
             url.contains("doramy-filmy") ->
-                doc.select("div.catalog-item.catalog-item_type_poster")
-                    .filter { it.selectFirst(".cinema-type-label.film") != null }
+                doc.select(".catalog-item")
 
             else -> doc.select("div.catalog-item.catalog-item_type_poster")
         }
+
+        val isMoviesPage = url.contains("doramy-filmy")
 
         val home = items.mapNotNull { el ->
 
@@ -55,7 +62,6 @@ class DoramaLandProvider : MainAPI() {
             val href = fixUrl(el.selectFirst("a")?.attr("href") ?: return@mapNotNull null)
 
             val img = el.selectFirst("img")
-
             val src = img?.attr("src")?.trim()
             val dataSrc = img?.attr("data-src")?.trim()
             val srcset = img?.attr("srcset")?.trim()
@@ -73,8 +79,8 @@ class DoramaLandProvider : MainAPI() {
                 if (it.startsWith("http")) it else "$mainUrl$it"
             }
 
-        // 🔥 визначаємо тип
-            val isMovie = el.selectFirst(".cinema-type-label.film") != null
+        // на сторінці фільмів усе вважаємо фільмами
+            val isMovie = isMoviesPage || el.selectFirst(".cinema-type-label.film") != null
 
             if (isMovie) {
                 newMovieSearchResponse(title, href, TvType.Movie) {
