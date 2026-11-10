@@ -1,0 +1,8 @@
+{
+  "name": "My-Verse",
+  "description": "My Verse CloudStream Extensions",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/Alla183/MY-Verse-CloudStream-Extension/builds/plugins.json"
+  ]
+}
