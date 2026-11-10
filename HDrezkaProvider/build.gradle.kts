@@ -8,7 +8,7 @@ android {
 } 
 
 cloudstream {
-    language = "ua"
+    language = "uk"
     // All of these properties are optional, you can safely remove them
 
     // description = "Lorem Ipsum"
