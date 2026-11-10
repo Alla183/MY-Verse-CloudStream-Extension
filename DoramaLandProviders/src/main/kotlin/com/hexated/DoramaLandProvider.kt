@@ -27,8 +27,8 @@ class DoramaLandProvider : MainAPI() {
         "$mainUrl/api/v2/html/serials" to "Усі дорами",
         "$mainUrl/api/v2/html/serials?tag_id=222&order=popular" to "Фільми",
         "$mainUrl/#popular" to "Популярне",
-        "$mainUrl/api/v2/html/serials?min_year={year}&max_year={year}#premieres" to "Прем'єри",
-        "$mainUrl/api/v2/html/serials?status_id=2#expected" to "Очікуване"
+        "$mainUrl/api/v2/html/serials?min_year={year}&max_year={year}" to "Прем'єри",
+        "$mainUrl/api/v2/html/serials?status_id=2" to "Очікуване"
     )
 
     
