@@ -66,7 +66,7 @@
     },
     {
         "iconUrl": "https://site.yummyani.me/favicon.ico",
-        "fileHash": "sha256-1e754c96684c6b8fbe6ef2485f3ce6f9348000b121c2856cdaa7463300680d47",
+        "fileHash": "sha256-c3ed7505626ca4f6388fce9ab104f3475396bd1f0ff6bbf32797f5f82b058fa9",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Alla183/MY-Verse-CloudStream-Extension",
         "fileSize": 55887,
@@ -78,7 +78,7 @@
         "tvTypes": [
             "Anime"
         ],
-        "version": 29,
+        "version": 30,
         "internalName": "YummyAnimeProvider",
         "url": "https://raw.githubusercontent.com/Alla183/MY-Verse-CloudStream-Extension/builds/YummyAnimeProvider.cs3",
         "name": "YummyAnimeProvider"
