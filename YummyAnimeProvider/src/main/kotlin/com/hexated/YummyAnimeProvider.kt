@@ -572,6 +572,22 @@ class YummyAnimeProvider : MainAPI() {
         }.any { it }
     }
 
+    private fun decodeCeramet(h: String?): String? {
+        if (h.isNullOrBlank()) return null
+        return try {
+            var b64 = h.replace('-', '+').replace('_', '/')
+            b64 += "=".repeat((4 - b64.length % 4) % 4)
+            val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+            val key = "xu0vKTL4wJBuU2j7".toByteArray()
+            val out = ByteArray(bytes.size) { i ->
+                (bytes[i].toInt() xor key[i % key.size].toInt()).toByte()
+            }
+            String(out, Charsets.UTF_8).takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     private suspend fun invokeCeramet(
         fileId: Int,
         label: String,
@@ -579,28 +595,24 @@ class YummyAnimeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Як у браузері: Referer = сторінка iframe, Cookie = PHPSESSID, виданий при її завантаженні
-        val resp = app.get(
+       val resp = app.get(
             "https://ceramet.net/videos.php?id=$fileId",
             referer = ctx.iframe,
             headers = yummyTvAjax,
             cookies = ctx.cookies
         )
         val json = JSONObject(resp.text)
-        val video = json.optString("video").trim()
-        if (video.isBlank()) return false
+        val video = decodeCeramet(json.optString("h")) ?: return false
 
-        val session = ctx.cookies + resp.cookies
-        val hlsHeaders = mutableMapOf(
-            "Referer" to ctx.iframe,
+    // Як у браузері для HLS-запитів: Referer = origin, плюс Origin, без Cookie
+        val hlsHeaders = mapOf(
+            "Referer" to "https://ceramet.net/",
+            "Origin" to "https://ceramet.net",
             "User-Agent" to yummyTvUa,
             "Accept" to "*/*"
         )
-        if (session.isNotEmpty()) {
-            hlsHeaders["Cookie"] = session.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        }
 
-        // "cc": {"ru": "...vtt"} або "cc": []
+    // "cc": {"ru": "...vtt"} або "cc": []
         json.optJSONObject("cc")?.let { cc ->
             cc.keys().forEach { code ->
                 val u = cc.optString(code).trim()
@@ -619,14 +631,13 @@ class YummyAnimeProvider : MainAPI() {
             M3u8Helper.generateM3u8(
                 source = label,
                 streamUrl = video,
-                referer = ctx.iframe,
+                referer = "https://ceramet.net/",
                 headers = hlsHeaders
             ).forEach(callback)
         } else {
-            // сервер віддав не плейлист — віддаємо посилання плеєру напряму
             callback(
                 newExtractorLink(label, label, video, ExtractorLinkType.M3U8) {
-                    this.referer = ctx.iframe
+                    this.referer = "https://ceramet.net/"
                     this.headers = hlsHeaders
                     this.quality = Qualities.Unknown.value
                 }
