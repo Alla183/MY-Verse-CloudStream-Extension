@@ -22,10 +22,10 @@
     },
     {
         "iconUrl": "https://www.google.com/s2/favicons?domain=rezka.ag&sz=%size%",
-        "fileHash": "sha256-5227bcf14d44a9cba37fca4448807ef03e064b4fcfce48935e2f25ea5f720d21",
+        "fileHash": "sha256-2aeb2874c35a998bda2694abc392ab832b1e761fa45689cc0c7356c6f1c7e9c0",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Alla183/MY-Verse-CloudStream-Extension",
-        "fileSize": 64156,
+        "fileSize": 65305,
         "status": 1,
         "language": "uk",
         "authors": [
@@ -38,7 +38,7 @@
             "TvSeries",
             "Movie"
         ],
-        "version": 19,
+        "version": 20,
         "internalName": "HDrezkaProvider",
         "url": "https://raw.githubusercontent.com/Alla183/MY-Verse-CloudStream-Extension/builds/HDrezkaProvider.cs3",
         "name": "HDrezkaProvider"
