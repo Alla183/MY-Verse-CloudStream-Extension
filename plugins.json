@@ -22,10 +22,10 @@
     },
     {
         "iconUrl": "https://www.google.com/s2/favicons?domain=rezka.ag&sz=%size%",
-        "fileHash": "sha256-af19f9dfe5a8a87fe9827fc794ce0b8036af194fcfebbc8ecc88ea923e771330",
+        "fileHash": "sha256-aff27d29cfbbfbb00bab88bac2531d0768fc780ba9672d1993c2df8535ebbcf9",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Alla183/MY-Verse-CloudStream-Extension",
-        "fileSize": 62868,
+        "fileSize": 64156,
         "status": 1,
         "language": "uk",
         "authors": [
