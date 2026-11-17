@@ -1,0 +1,1417 @@
+package com.hexated
+
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.getQualityFromName
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import android.app.Dialog
+import android.content.Context
+import android.view.ViewGroup
+import android.widget.Button
+import android.widget.LinearLayout
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import org.json.JSONObject
+import org.json.JSONTokener
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import java.net.URLEncoder
+import java.security.MessageDigest
+import java.util.*
+
+/**
+ * HDrezka — scrape of public mirrors.
+ * Clears Techaro Anubis via an OkHttp interceptor ([anubisKiller]): detects the challenge page,
+ * solves the SHA-256 PoW, calls pass-challenge on a no-redirect client and caches the
+ * `*-anubis-auth` cookie. If the PoW path fails, a hidden WebView solves it (needs
+ * [HDrezkaProvider.context] to be set from the Plugin class).
+ *
+ * When the site serves its 403 "suspicious activity" stub to OkHttp (IP flagged), pages and
+ * AJAX POSTs are retried through a hidden WebView ([webViewRun] / [postText]), which looks like
+ * a real browser and shares cookies with the manual login dialog.
+ */
+class HDrezkaProvider : MainAPI() {
+    override var mainUrl = "https://rezka.ag"
+    override var name = "HDrezka"
+    override val hasMainPage = true
+    override var lang = "uk"
+    override val hasDownloadSupport = true
+    override val supportedTypes = setOf(
+        TvType.Movie,
+        TvType.TvSeries,
+        TvType.Anime,
+        TvType.AsianDrama
+    )
+
+    companion object {
+        /** Set from HDrezkaProviderPlugin.load(); used only by the WebView fallback. */
+        @Volatile
+        var context: Context? = null
+
+        /** Open-source defaults from n0madic/go-hdrezka + common public mirrors. */
+        private val MIRRORS = listOf(
+            "https://rezka.ag",
+            "https://hdrezka-home.tv",
+            "https://hdrezka.ag",
+            "https://hdrzk.org",
+            "https://hdrezka.co",
+            "https://rezka-ua.in",
+        )
+
+        private val ANUBIS_SCRIPT = Regex(
+            """<script[^>]*id=["']anubis_challenge["'][^>]*>([\s\S]*?)</script>""",
+            RegexOption.IGNORE_CASE,
+        )
+        private val ANUBIS_ID = Regex(
+            """id=["']anubis_challenge["']""",
+            RegexOption.IGNORE_CASE,
+        )
+        private val ANUBIS_PREFIX = Regex(
+            """<script[^>]*id=["']anubis_base_prefix["'][^>]*>([\s\S]*?)</script>""",
+            RegexOption.IGNORE_CASE,
+        )
+    }
+
+    @Volatile
+    private var mirrorReady = false
+
+    private fun isAnubisChallenge(html: String): Boolean =
+        html.contains("anubis", ignoreCase = true) ||
+            html.contains("within.website", ignoreCase = true) ||
+            html.contains("not a bot", ignoreCase = true) ||
+            html.contains("не бот", ignoreCase = true)
+
+    /** The site's own IP block page ("Ошибка доступа (403) ... подозрительная активность"). */
+    private fun isBlockedPage(html: String): Boolean =
+        html.contains("подозрительная активность", ignoreCase = true) ||
+            html.contains("Ошибка доступа", ignoreCase = true) ||
+            html.contains("підозріла активність", ignoreCase = true)
+
+    private fun blockedError() = ErrorLoadingException(
+        "HDrezka: сайт блокує ваш IP (403, «підозріла активність»). Змініть мережу або VPN і спробуйте ще раз."
+    )
+
+    /** Keep [mainUrl] on the host OkHttp actually landed on (ag → home.tv redirects). */
+    private fun syncMainUrl(finalUrl: String?) {
+        if (finalUrl.isNullOrBlank()) return
+        try {
+            val u = java.net.URI(finalUrl)
+            if (!u.scheme.isNullOrBlank() && !u.host.isNullOrBlank()) {
+                mainUrl = "${u.scheme}://${u.host}"
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Anubis 1.25 "fast" PoW: leading zero **bytes** (and high nibble if odd difficulty),
+     * matching `sha256-purejs.mjs` worker — not hex-char prefix alone.
+     */
+    private fun solveAnubisPow(randomData: String, difficulty: Int): Pair<Int, String> {
+        val fullBytes = difficulty / 2
+        val odd = difficulty % 2 != 0
+        val md = MessageDigest.getInstance("SHA-256")
+        var nonce = 0
+        while (true) {
+            val digest = md.digest("$randomData$nonce".toByteArray(Charsets.UTF_8))
+            md.reset()
+            var ok = true
+            for (i in 0 until fullBytes) {
+                if (digest[i] != 0.toByte()) {
+                    ok = false
+                    break
+                }
+            }
+            if (ok && odd && ((digest[fullBytes].toInt() and 0xff) shr 4) != 0) {
+                ok = false
+            }
+            if (ok) {
+                val hex = buildString(digest.size * 2) {
+                    for (b in digest) append("%02x".format(b))
+                }
+                return nonce to hex
+            }
+            nonce++
+            if (nonce > 50_000_000) error("Anubis PoW too hard")
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Anubis handling (ported from the working .cs3 build)
+    // ---------------------------------------------------------------------------------
+    private val anubisUa =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+
+    private val anubisLang = "uk-UA,uk;q=0.9,ru;q=0.8,en-US;q=0.7,en;q=0.6"
+
+    @Volatile
+    private var anubisCookie: String = ""
+    private val anubisLock = Any()
+
+    @Volatile
+    private var lastWebViewAttempt = 0L
+
+    @Volatile
+    private var lastDialogAttempt = 0L
+
+    /** Final URL the user's WebView ended on in the manual dialog (host may differ from the mirror we asked). */
+    @Volatile
+    private var dialogFinalUrl: String? = null
+
+    /** No-redirect client: the 302 from pass-challenge carries the auth Set-Cookie. */
+    private val anubisClient: OkHttpClient by lazy {
+        app.baseClient.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+    }
+
+    /**
+     * Cookies for [url] = WebView CookieManager (persisted, holds the site login the user did in the
+     * dialog) overlaid with [extra] (the in-memory Anubis cookie). Same name -> [extra] wins.
+     */
+    private fun mergedCookie(url: String, extra: String): String {
+        val map = LinkedHashMap<String, String>()
+        fun add(raw: String) {
+            raw.split(";").map { it.trim() }.filter { it.contains("=") }
+                .forEach { map[it.substringBefore("=")] = it.substringAfter("=") }
+        }
+        try {
+            add(CookieManager.getInstance().getCookie(url).orEmpty())
+        } catch (_: Throwable) {
+        }
+        add(extra)
+        return map.entries.joinToString("; ") { "${it.key}=${it.value}" }
+    }
+
+    private val anubisKiller = object : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val original = chain.request()
+            val used = anubisCookie
+            val first = original.newBuilder().apply {
+                mergedCookie(original.url.toString(), used).let { if (it.isNotEmpty()) header("Cookie", it) }
+                header("User-Agent", anubisUa)
+                header("Accept-Language", anubisLang)
+            }.build()
+
+            val resp = chain.proceed(first)
+            val body = try {
+                resp.peekBody(512L * 1024L).string()
+            } catch (_: Throwable) {
+                return resp
+            }
+            if (isBlockedPage(body)) {
+                // Plain HTTP client got the 403 stub while a real browser would pass:
+                // let a real WebView obtain the cookies once (cooldown 2 min), then retry.
+                val blockUrl = resp.request.url.toString()
+                resp.close()
+                synchronized(anubisLock) {
+                    val now = System.currentTimeMillis()
+                    if ((anubisCookie.isEmpty() || anubisCookie == used) && now - lastWebViewAttempt > 120_000L) {
+                        lastWebViewAttempt = now
+                        val c = getAnubisCookie(blockUrl)
+                        Log.i("HDrezka", "403 block -> WebView cookies obtained=${c.isNotEmpty()} host=${original.url.host}")
+                        if (c.isNotEmpty()) anubisCookie = c
+                    }
+                }
+                val again = original.newBuilder().apply {
+                    mergedCookie(original.url.toString(), anubisCookie).let { if (it.isNotEmpty()) header("Cookie", it) }
+                    header("User-Agent", anubisUa)
+                    header("Accept-Language", anubisLang)
+                }.build()
+                val after = chain.proceed(again)
+                try {
+                    val still = isBlockedPage(after.peekBody(512L * 1024L).string())
+                    val names = anubisCookie.split(";").map { it.trim().substringBefore("=") }.filter { it.isNotEmpty() }
+                    Log.w(
+                        "HDrezka",
+                        "after WebView cookies: stillBlocked=$still code=${after.code} host=${after.request.url.host} cookieNames=$names",
+                    )
+                } catch (_: Throwable) {
+                }
+                return after
+            }
+            if (!ANUBIS_ID.containsMatchIn(body)) {
+                // Looks like an anti-bot page but not the markup we know -> log what it is.
+                if (body.contains("anubis", true) || body.contains("within.website", true) ||
+                    body.contains("not a bot", true) || body.contains("не бот", true)
+                ) {
+                    val ids = Regex("""<script[^>]*id=["']([^"']+)["']""").findAll(body)
+                        .map { it.groupValues[1] }.toList()
+                    val title = Regex("""<title>([\s\S]*?)</title>""", RegexOption.IGNORE_CASE)
+                        .find(body)?.groupValues?.getOrNull(1)?.trim()
+                    Log.w(
+                        "HDrezka",
+                        "UNKNOWN anti-bot markup host=${original.url.host} code=${resp.code} len=${body.length} " +
+                            "title='$title' scriptIds=$ids",
+                    )
+                }
+                return resp
+            }
+
+            // Solve on the host that actually served the challenge (after redirects).
+            val challengeUrl = resp.request.url.toString()
+            val challengeCookies = resp.headers("Set-Cookie")
+            resp.close()
+
+            synchronized(anubisLock) {
+                if (anubisCookie.isEmpty() || anubisCookie == used) {
+                    var cookie = solveAnubis(challengeUrl, body, challengeCookies)
+                    if (cookie.isEmpty()) cookie = getAnubisCookie(challengeUrl)
+                    if (cookie.isNotEmpty()) anubisCookie = cookie
+                    Log.i("HDrezka", "anubis solved host=${original.url.host} gotCookie=${cookie.isNotEmpty()}")
+                }
+            }
+
+            val retry = original.newBuilder().apply {
+                mergedCookie(original.url.toString(), anubisCookie).let { if (it.isNotEmpty()) header("Cookie", it) }
+                header("User-Agent", anubisUa)
+                header("Accept-Language", anubisLang)
+            }.build()
+            val retried = chain.proceed(retry)
+            try {
+                val retriedBody = retried.peekBody(512L * 1024L).string()
+                if (isBlockedPage(retriedBody)) {
+                    val names = mergedCookie(original.url.toString(), anubisCookie)
+                        .split(";").map { it.trim().substringBefore("=") }
+                    Log.w(
+                        "HDrezka",
+                        "BLOCKED after anubis solve code=${retried.code} host=${retried.request.url.host} cookieNames=$names",
+                    )
+                }
+                if (ANUBIS_ID.containsMatchIn(retriedBody)) {
+                    Log.w("HDrezka", "anubis STILL served after retry host=${original.url.host} code=${retried.code}")
+                    anubisCookie = "" // don't keep a cookie the server rejects
+                }
+            } catch (_: Throwable) {
+            }
+            return retried
+        }
+    }
+
+    /** Returns the `anubis-auth` cookie string ("name=value; ...") or "" on failure. */
+    private fun solveAnubis(url: String, html: String, challengeSetCookies: List<String>): String {
+        try {
+            val raw = ANUBIS_SCRIPT.find(html)?.groupValues?.getOrNull(1)?.trim() ?: return ""
+            val payload = tryParseJson<AnubisPayload>(raw) ?: return ""
+            val ch = payload.challenge ?: return ""
+            val method = ch.method ?: payload.rules?.algorithm
+            Log.i(
+                "HDrezka",
+                "anubis challenge method=$method difficulty=${ch.difficulty ?: payload.rules?.difficulty} host=${url.toHttpUrl().host}",
+            )
+            // Only the SHA-256 PoW variants are solvable here; everything else -> WebView.
+            if (method != null && method != "fast" && method != "slow") {
+                Log.w("HDrezka", "anubis method '$method' not solvable via PoW -> WebView fallback")
+                return ""
+            }
+            val difficulty = ch.difficulty ?: payload.rules?.difficulty ?: return ""
+            val id = ch.id ?: return ""
+            val randomData = ch.randomData ?: return ""
+
+            val started = System.currentTimeMillis()
+            val (nonce, response) = solveAnubisPow(randomData, difficulty)
+            val elapsed = (System.currentTimeMillis() - started).coerceAtLeast(50L)
+
+            val u = url.toHttpUrl()
+            val origin = "${u.scheme}://${u.host}"
+            val basePrefix = ANUBIS_PREFIX.find(html)?.groupValues?.getOrNull(1)
+                ?.trim()?.trim('"')?.trim().orEmpty()
+
+            val passUrl = "$origin$basePrefix/.within.website/x/cmd/anubis/api/pass-challenge"
+                .toHttpUrl().newBuilder()
+                .addQueryParameter("id", id)
+                .addQueryParameter("response", response)
+                .addQueryParameter("nonce", nonce.toString())
+                .addQueryParameter("redir", url)
+                .addQueryParameter("elapsedTime", elapsed.toString())
+                .build()
+
+            // Cookies set together with the challenge page (e.g. *-cookie-verification) go back.
+            val sendCookies = challengeSetCookies
+                .map { it.substringBefore(";").trim() }
+                .filter { it.substringBefore("=").contains("anubis", ignoreCase = true) && it.substringAfter("=", "").isNotEmpty() }
+
+            val req = Request.Builder()
+                .url(passUrl)
+                .header("User-Agent", anubisUa)
+                .header("Accept-Language", anubisLang)
+                .header("Referer", url)
+                .apply { if (sendCookies.isNotEmpty()) header("Cookie", sendCookies.joinToString("; ")) }
+                .build()
+
+            val cookie = anubisClient.newCall(req).execute().use { r ->
+                val auth = r.headers("Set-Cookie")
+                    .map { it.substringBefore(";").trim() }
+                    .filter { it.substringBefore("=").contains("anubis-auth", ignoreCase = true) && it.substringAfter("=", "").isNotEmpty() }
+                Log.i("HDrezka", "anubis pass code=${r.code} nonce=$nonce ${elapsed}ms auth=${auth.size}")
+                auth.joinToString("; ")
+            }
+            return cookie
+        } catch (t: Throwable) {
+            Log.w("HDrezka", "solveAnubis failed: ${t.message}")
+            return ""
+        }
+    }
+
+    /** Fallback: let a real WebView run the Anubis JS and read the auth cookie back. */
+    private fun getAnubisCookie(url: String): String {
+        val ctx = context
+        if (ctx == null) {
+            Log.w("HDrezka", "WebView fallback unavailable: HDrezkaProvider.context is null (set it in Plugin.load())")
+            return ""
+        }
+        val latch = CountDownLatch(1)
+        val result = AtomicReference("")
+        val main = Handler(Looper.getMainLooper())
+
+        main.post {
+            try {
+                val cm = CookieManager.getInstance()
+                cm.getCookie(url).orEmpty().split(";")
+                    .map { it.trim().substringBefore("=") }
+                    .filter { it.contains("anubis", ignoreCase = true) }
+                    .forEach { cm.setCookie(url, "$it=; Max-Age=0; Path=/") }
+
+                val wv = WebView(ctx)
+                wv.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    loadsImagesAutomatically = false
+                    blockNetworkImage = true
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    userAgentString = anubisUa
+                }
+                wv.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
+                }
+
+                fun finish() {
+                    try {
+                        wv.stopLoading()
+                        wv.destroy()
+                    } catch (_: Throwable) {
+                    }
+                    if (latch.count > 0) latch.countDown()
+                }
+
+                val deadline = System.currentTimeMillis() + 25_000L
+                val checker = object : Runnable {
+                    override fun run() {
+                        val cookies = CookieManager.getInstance().getCookie(url).orEmpty()
+                            .split(";").map { it.trim() }.filter { it.isNotEmpty() }
+                        if (cookies.any { it.substringBefore("=").contains("anubis-auth", ignoreCase = true) }) {
+                            result.set(cookies.joinToString("; "))
+                            finish()
+                        } else if (System.currentTimeMillis() < deadline) {
+                            main.postDelayed(this, 500L)
+                        } else {
+                            finish()
+                        }
+                    }
+                }
+                wv.loadUrl(url)
+                main.postDelayed(checker, 800L)
+            } catch (t: Throwable) {
+                Log.w("HDrezka", "webview anubis failed: ${t.message}")
+                latch.countDown()
+            }
+        }
+        latch.await(30, TimeUnit.SECONDS)
+        return result.get()
+    }
+
+    /**
+     * Last resort: show a visible full-screen WebView so the user can pass the captcha / log in by hand.
+     * The user taps "Готово" when the site is open; we then take that WebView's cookies.
+     * Needs [context] to be an Activity (CloudStream passes it to Plugin.load()).
+     */
+    private fun getCookieViaDialog(url: String): String {
+        val ctx = context ?: return ""
+        val latch = CountDownLatch(1)
+        val result = AtomicReference("")
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val dialog = Dialog(ctx, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+                val wv = WebView(ctx)
+                wv.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    userAgentString = anubisUa
+                }
+                wv.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
+                }
+
+                fun finish(ok: Boolean) {
+                    try {
+                        if (ok) {
+                            val cm = CookieManager.getInstance()
+                            dialogFinalUrl = wv.url
+                            val got = cm.getCookie(wv.url ?: url).orEmpty()
+                            result.set(got)
+                            cm.flush()
+                            Log.i(
+                                "HDrezka",
+                                "dialog done wvUrl=${wv.url} cookieNames=${got.split(";").map { it.trim().substringBefore("=") }}",
+                            )
+                        }
+                        wv.stopLoading()
+                        wv.destroy()
+                        dialog.dismiss()
+                    } catch (_: Throwable) {
+                    }
+                    latch.countDown()
+                }
+
+                val done = Button(ctx).apply {
+                    text = "Готово — сайт відкрився"
+                    setOnClickListener { finish(true) }
+                }
+                val cancel = Button(ctx).apply {
+                    text = "Скасувати"
+                    setOnClickListener { finish(false) }
+                }
+                val bar = LinearLayout(ctx).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(done, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    addView(cancel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                }
+                val root = LinearLayout(ctx).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                    addView(wv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                }
+                dialog.setContentView(root)
+                dialog.setCancelable(false)
+                dialog.show()
+                wv.loadUrl(url)
+            } catch (t: Throwable) {
+                Log.w("HDrezka", "manual WebView dialog failed: ${t.message}")
+                latch.countDown()
+            }
+        }
+        latch.await(180, TimeUnit.SECONDS)
+        return result.get()
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Hidden-WebView transport (used when OkHttp is served the 403 stub)
+    // ---------------------------------------------------------------------------------
+
+    /** Decodes the result of evaluateJavascript (a JSON string literal) into a plain string. */
+    private fun decodeJs(raw: String?): String = try {
+        if (raw == null || raw == "null") "" else (JSONTokener(raw).nextValue() as? String).orEmpty()
+    } catch (_: Throwable) {
+        ""
+    }
+
+    /**
+     * Hidden WebView: opens [url], waits until Anubis/JS finish and the page is not a block stub,
+     * then returns the page HTML or the result of [script]. Must NOT be called from the main thread.
+     */
+    private fun webViewRun(url: String, script: String? = null, timeoutMs: Long = 30_000L): String {
+        val ctx = context
+        if (ctx == null) {
+            Log.w("HDrezka", "webViewRun unavailable: HDrezkaProvider.context is null (set it in Plugin.load())")
+            return ""
+        }
+        val latch = CountDownLatch(1)
+        val result = AtomicReference("")
+        val main = Handler(Looper.getMainLooper())
+        main.post {
+            try {
+                val wv = WebView(ctx)
+                wv.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    blockNetworkImage = true
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                }
+                wv.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
+                }
+
+                fun finish() {
+                    try {
+                        wv.stopLoading()
+                        wv.destroy()
+                    } catch (_: Throwable) {
+                    }
+                    latch.countDown()
+                }
+
+                val deadline = System.currentTimeMillis() + timeoutMs
+                val poll = object : Runnable {
+                    override fun run() {
+                        wv.evaluateJavascript("document.documentElement.outerHTML") { raw ->
+                            val html = decodeJs(raw)
+                            val ready = html.length > 500 &&
+                                !ANUBIS_ID.containsMatchIn(html) && !isBlockedPage(html)
+                            if (ready) {
+                                if (script == null) {
+                                    result.set(html)
+                                    finish()
+                                } else {
+                                    wv.evaluateJavascript(script) { r ->
+                                        result.set(decodeJs(r))
+                                        finish()
+                                    }
+                                }
+                            } else if (System.currentTimeMillis() < deadline) {
+                                main.postDelayed(this, 700L)
+                            } else {
+                                finish()
+                            }
+                        }
+                    }
+                }
+                wv.loadUrl(url)
+                main.postDelayed(poll, 1000L)
+            } catch (t: Throwable) {
+                Log.w("HDrezka", "webViewRun failed: ${t.message}")
+                latch.countDown()
+            }
+        }
+        latch.await(timeoutMs + 5_000L, TimeUnit.MILLISECONDS)
+        return result.get()
+    }
+
+    /** POST: OkHttp first; on block/non-2xx the same request is sent from a WebView (sync XHR, same origin). */
+    private suspend fun postText(url: String, data: Map<String, String>, referer: String? = null): String {
+        val resp = try {
+            httpPost(url, data, referer)
+        } catch (_: Throwable) {
+            null
+        }
+        val text = resp?.text.orEmpty()
+        if (resp != null && resp.code in 200..299 && !isBlockedPage(text)) return text
+
+        val u = url.toHttpUrl()
+        val origin = "${u.scheme}://${u.host}"
+        val body = data.entries.joinToString("&") {
+            "${URLEncoder.encode(it.key, "UTF-8")}=${URLEncoder.encode(it.value, "UTF-8")}"
+        }
+        val js = "(function(){var x=new XMLHttpRequest();" +
+            "x.open('POST',${JSONObject.quote(url)},false);" +
+            "x.setRequestHeader('Content-Type','application/x-www-form-urlencoded; charset=UTF-8');" +
+            "x.setRequestHeader('X-Requested-With','XMLHttpRequest');" +
+            "x.send(${JSONObject.quote(body)});return x.responseText;})()"
+        Log.i("HDrezka", "POST via WebView $url")
+        return withContext(Dispatchers.IO) { webViewRun("$origin/", js) }
+    }
+
+    // All site requests go through [anubisKiller].
+    private suspend fun httpGet(url: String, referer: String? = null) =
+        app.get(url, referer = referer, interceptor = anubisKiller)
+
+    private suspend fun httpPost(url: String, data: Map<String, String>, referer: String? = null) =
+        app.post(url, data = data, referer = referer, interceptor = anubisKiller)
+
+    private suspend fun fetchDocument(url: String): Document {
+        val resp = httpGet(url)
+        var html = resp.text
+        var base = resp.url
+        if (isBlockedPage(html)) {
+            Log.i("HDrezka", "GET blocked, trying WebView for $url")
+            val wvHtml = withContext(Dispatchers.IO) { webViewRun(url) }
+            if (wvHtml.isNotEmpty() && !isBlockedPage(wvHtml)) {
+                html = wvHtml
+                base = url
+            }
+        }
+        syncMainUrl(base)
+        return Jsoup.parse(html, base)
+    }
+
+    private fun filmPath(url: String): String {
+        return try {
+            val u = java.net.URI(if (url.startsWith("http")) url else pageUrl(url))
+            (u.rawPath ?: "/") + (u.rawQuery?.let { "?$it" } ?: "")
+        } catch (_: Exception) {
+            url.substringAfter(mainUrl, url).let { if (it.startsWith("/")) it else "/$it" }
+        }
+    }
+
+    private fun isUsableFilmPage(doc: Document): Boolean {
+        if (isAnubisChallenge(doc.html())) return false
+        val hasFavs = !doc.selectFirst("input#ctrl_favs")?.attr("value").isNullOrBlank()
+        val hasTr = doc.select("ul#translators-list li").isNotEmpty()
+        val hasTitle = doc.selectFirst("div.b-post__title h1, div.b-post__origtitle") != null
+        return hasTitle && (hasFavs || hasTr)
+    }
+
+    /**
+     * Film pages are host-sensitive (dead mirrors like rezka-ua.in).
+     * Try the path on the given host, then on every mirror; Anubis is cleared by the interceptor.
+     */
+    private suspend fun fetchFilmDocument(url: String): Pair<Document, String> {
+        val path = filmPath(url)
+        val tried = LinkedHashSet<String>()
+        val candidates = mutableListOf<String>()
+        candidates += pageUrl(url)
+        candidates += "$mainUrl$path"
+        for (m in MIRRORS) {
+            candidates += m.trimEnd('/') + path
+        }
+        var lastDoc: Document? = null
+        var lastUrl = pageUrl(url)
+        for (candidate in candidates) {
+            if (!tried.add(candidate)) continue
+            try {
+                // OkHttp + possible WebView fallback can take longer together.
+                val doc = withTimeoutOrNull(90_000L) { fetchDocument(candidate) } ?: continue
+                if (isBlockedPage(doc.html())) throw blockedError()
+                lastDoc = doc
+                lastUrl = candidate
+                if (isUsableFilmPage(doc)) {
+                    syncMainUrl(candidate)
+                    Log.i("HDrezka", "film OK $candidate translators=${doc.select("ul#translators-list li").size}")
+                    return doc to candidate
+                }
+                Log.w(
+                    "HDrezka",
+                    "film unusable $candidate len=${doc.html().length} anubis=${isAnubisChallenge(doc.html())}",
+                )
+            } catch (t: ErrorLoadingException) {
+                throw t
+            } catch (t: Throwable) {
+                Log.w("HDrezka", "film try failed $candidate: ${t.message}")
+            }
+        }
+        return (lastDoc ?: fetchDocument(pageUrl(url))) to lastUrl
+    }
+
+    private suspend fun ensureWorkingMirror() {
+        if (mirrorReady) return
+        var blockedAt: String? = null
+        for (mirror in MIRRORS) {
+            try {
+                val base = mirror.trimEnd('/')
+                val resp = withTimeoutOrNull(40_000L) { httpGet(base) } ?: continue
+                val html = resp.text
+                if (isBlockedPage(html)) {
+                    Log.w("HDrezka", "ensureWorkingMirror: 403 block page on $base")
+                    // OkHttp is blocked: a real WebView may still get through (shares cookies with the dialog).
+                    val wvHtml = withContext(Dispatchers.IO) { webViewRun(base) }
+                    if (wvHtml.isNotEmpty() &&
+                        Jsoup.parse(wvHtml, base).select("div.b-content__inline_item").isNotEmpty()
+                    ) {
+                        syncMainUrl(base)
+                        mirrorReady = true
+                        return
+                    }
+                    // Same backend on every mirror: stop hammering, it only makes the block worse.
+                    blockedAt = base
+                    break
+                }
+                val doc = Jsoup.parse(html, resp.url)
+                val ok = doc.select("div.b-content__inline_item").isNotEmpty()
+                if (ok && !isAnubisChallenge(html)) {
+                    syncMainUrl(resp.url)
+                    mirrorReady = true
+                    return
+                }
+            } catch (_: Exception) {
+                // try next
+            }
+        }
+        val blockedBase = blockedAt
+        if (blockedBase != null) {
+            // Automatic ways failed: let the user pass the check by hand in a visible WebView.
+            val now = System.currentTimeMillis()
+            if (now - lastDialogAttempt > 60_000L) {
+                lastDialogAttempt = now
+                val c = withContext(Dispatchers.IO) { getCookieViaDialog(blockedBase) }
+                Log.i("HDrezka", "manual dialog cookies obtained=${c.isNotEmpty()}")
+                if (c.isNotEmpty()) {
+                    anubisCookie = c
+                    // Don't let the hidden-WebView cookie refresh wipe what the user just obtained.
+                    lastWebViewAttempt = System.currentTimeMillis()
+                    // Work on the host where the user actually passed the check.
+                    val passedBase = dialogFinalUrl?.let {
+                        try {
+                            val u = java.net.URI(it)
+                            if (!u.scheme.isNullOrBlank() && !u.host.isNullOrBlank()) "${u.scheme}://${u.host}" else null
+                        } catch (_: Exception) {
+                            null
+                        }
+                    } ?: blockedBase
+                    syncMainUrl(passedBase)
+
+                    val wvHtml = withContext(Dispatchers.IO) { webViewRun(passedBase) }
+                    if (wvHtml.isNotEmpty() && !isBlockedPage(wvHtml)) {
+                        syncMainUrl(passedBase)
+                        mirrorReady = true
+                        return
+                    }
+                    try {
+                        val resp = withTimeoutOrNull(40_000L) { httpGet(passedBase) }
+                        Log.i(
+                            "HDrezka",
+                            "retry after dialog code=${resp?.code} url=${resp?.url} len=${resp?.text?.length} blocked=${resp?.text?.let { isBlockedPage(it) }}",
+                        )
+                        if (resp != null && !isBlockedPage(resp.text)) {
+                            syncMainUrl(resp.url)
+                            mirrorReady = true
+                            return
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            throw blockedError()
+        }
+        // Nothing usable: do NOT latch, so the next call retries.
+        Log.w("HDrezka", "ensureWorkingMirror: no mirror usable, will retry next call")
+    }
+
+    private fun pageUrl(pathQuery: String): String {
+        val p = pathQuery.trim()
+        if (p.startsWith("http://") || p.startsWith("https://")) {
+            // Keep the search-result host (often hdrezka-home.tv); only rewrite path onto
+            // current mainUrl when we already synced to that mirror.
+            return try {
+                val u = java.net.URI(p)
+                val path = u.rawPath ?: "/"
+                val q = u.rawQuery?.let { "?$it" }.orEmpty()
+                val host = u.host
+                if (!host.isNullOrBlank() && mainUrl.contains(host, ignoreCase = true)) {
+                    p
+                } else if (!host.isNullOrBlank()) {
+                    // Prefer the URL's own host — Anubis cookies are host-scoped.
+                    "${u.scheme}://$host$path$q"
+                } else {
+                    "$mainUrl$path$q"
+                }
+            } catch (_: Exception) {
+                p
+            }
+        }
+        return mainUrl + if (p.startsWith("/")) p else "/$p"
+    }
+
+    // Paths only — host resolved via [ensureWorkingMirror]
+    override val mainPage = mainPageOf(
+        "/films/?filter=last" to "фильмы — новинки",
+        "/films/?filter=watching" to "фильмы — смотрят",
+        "/films/?filter=popular" to "фильмы — популярные",
+        "/series/?filter=last" to "сериалы — новинки",
+        "/series/?filter=watching" to "сериалы — смотрят",
+        "/series/?filter=popular" to "сериалы — популярные",
+        "/cartoons/?filter=last" to "мультфильмы — новинки",
+        "/cartoons/?filter=watching" to "мультфильмы — смотрят",
+        "/animation/?filter=last" to "аниме — новинки",
+        "/animation/?filter=watching" to "аниме — смотрят",
+    )
+
+    override suspend fun getMainPage(
+        page: Int,
+        request: MainPageRequest
+    ): HomePageResponse {
+        ensureWorkingMirror()
+        val parts = request.data.split("?", limit = 2)
+        val path = parts.first()
+        val query = parts.getOrNull(1)?.let { "?$it" }.orEmpty()
+        val rel = "${path}page/$page/$query"
+        val itemSel = "div.b-content__inline_items div.b-content__inline_item"
+        var doc = fetchDocument(pageUrl(rel))
+        var home = doc.select(itemSel).map { it.toSearchResult() }
+        if (home.isEmpty()) {
+            val why = if (isAnubisChallenge(doc.html())) "Anubis challenge not solved" else "no items parsed (len=${doc.html().length})"
+            Log.w(
+                "HDrezka",
+                "mainPage empty host=$mainUrl: $why title='${doc.title()}' " +
+                    "inline_item=${doc.select("div.b-content__inline_item").size} " +
+                    "filmLinks=${doc.select("a[href*=/films/], a[href*=/series/]").size} " +
+                    "snippet='${doc.body().text().take(200)}'",
+            )
+            if (isBlockedPage(doc.html())) throw blockedError()
+            // The default host may be a landing/stub page: try the other mirrors.
+            for (m in MIRRORS) {
+                val base = m.trimEnd('/')
+                if (mainUrl.equals(base, ignoreCase = true)) continue
+                try {
+                    val d = withTimeoutOrNull(40_000L) { fetchDocument(base + "/" + rel.trimStart('/')) } ?: continue
+                    val h = d.select(itemSel).map { it.toSearchResult() }
+                    Log.i("HDrezka", "mainPage mirror $base items=${h.size}")
+                    if (h.isNotEmpty()) {
+                        syncMainUrl(base)
+                        doc = d
+                        home = h
+                        break
+                    }
+                } catch (t: Throwable) {
+                    Log.w("HDrezka", "mainPage mirror $base failed: ${t.message}")
+                }
+            }
+            if (home.isEmpty() && page == 1) throw ErrorLoadingException("HDrezka: $why")
+        }
+
+        return newHomePageResponse(request.name, home)
+    }
+
+    private fun Element.toSearchResult(): SearchResponse {
+        val title =
+            this.selectFirst("div.b-content__inline_item-link > a")?.text()?.trim().toString()
+        val href = this.selectFirst("a")?.attr("href").toString()
+        val posterUrl = this.select("img").attr("src")
+        val year = this.selectFirst("div.b-content__inline_item-link > div")?.text()
+            ?.let { Regex("""(?:19|20)\d{2}""").find(it)?.value?.toIntOrNull() }
+            ?: Regex("""(?<![0-9])((?:19|20)\d{2})(?![0-9])""").findAll(href)
+                .mapNotNull { it.groupValues[1].toIntOrNull() }.lastOrNull()
+        val type = if (this.select("span.info").isNotEmpty()) TvType.TvSeries else TvType.Movie
+        return if (type == TvType.Movie) {
+            newMovieSearchResponse(title, href, TvType.Movie) {
+                this.posterUrl = posterUrl
+                this.year = year
+            }
+        } else {
+            val episode =
+                this.select("span.info").text().substringAfter(",").replace(Regex("[^0-9]"), "")
+                    .toIntOrNull()
+            newAnimeSearchResponse(title, href, TvType.TvSeries) {
+                this.posterUrl = posterUrl
+                this.year = year
+                addDubStatus(
+                    dubExist = true,
+                    dubEpisodes = episode,
+                    subExist = true,
+                    subEpisodes = episode
+                )
+            }
+        }
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        ensureWorkingMirror()
+        val link = "$mainUrl/search/?do=search&subaction=search&q=$query"
+        val document = fetchDocument(link)
+
+        return document.select("div.b-content__inline_items div.b-content__inline_item").map {
+            it.toSearchResult()
+        }
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        ensureWorkingMirror()
+        val (document, resolved) = fetchFilmDocument(url)
+
+        val id = resolved.split("/").last().split("-").first()
+        val title = (document.selectFirst("div.b-post__title h1")?.text()?.trim()
+            ?: document.selectFirst("div.b-post__origtitle")?.text()?.trim()).toString()
+
+        val poster = fixUrlNull(document.selectFirst("div.b-sidecover img")?.attr("src"))
+        val tags =
+            document.select("table.b-post__info > tbody > tr:contains(Жанр) span[itemprop=genre]")
+                .map { it.text() }
+        val year = document.select("div.film-info > div:nth-child(2) a").text().toIntOrNull()
+        val tvType = if (document.select("div#simple-episodes-tabs")
+                .isNullOrEmpty()
+        ) TvType.Movie else TvType.TvSeries
+        val description = document.selectFirst("div.b-post__description_text")?.text()?.trim()
+        val trailer = tryParseJson<Trailer>(
+            postText(
+                "$mainUrl/engine/ajax/gettrailervideo.php",
+                mapOf("id" to id),
+                resolved
+            )
+        )?.code.let {
+            Jsoup.parse(it.toString()).select("iframe").attr("src")
+        }
+        val rating =
+            document.selectFirst("table.b-post__info > tbody > tr:nth-child(1) span.bold")?.text()
+        val actors =
+            document.select("table.b-post__info > tbody > tr:last-child span.item").mapNotNull {
+                Actor(
+                    it.selectFirst("span[itemprop=name]")?.text() ?: return@mapNotNull null,
+                    it.selectFirst("span[itemprop=actor]")?.attr("data-photo")
+                )
+            }
+
+        val recommendations = buildList {
+            // Старые рекомендации
+            addAll(
+                document.select("div.b-sidelist div.b-content__inline_item")
+                    .mapNotNull { it.toSearchResult() }
+            )
+
+            // Новые рекомендации
+            addAll(
+                document.select("div.b-post__partcontent_item[data-url]")
+                    .mapNotNull { item ->
+                        val href = item.attr("data-url")
+                            .ifBlank { item.selectFirst("a")?.attr("href") ?: "" }
+
+                        val title = item.selectFirst(".title")?.text()?.trim()
+                            ?: item.selectFirst("a")?.text()?.trim()
+                            ?: return@mapNotNull null
+
+                        val year = item.selectFirst(".year")
+                            ?.text()
+                            ?.filter(Char::isDigit)
+                            ?.toIntOrNull()
+
+                        val num = item.selectFirst(".td.num")?.text()?.trim().orEmpty()
+
+                        newMovieSearchResponse(
+                            "$num. $title",
+                            fixUrl(href),
+                            TvType.Movie
+                        ) {
+                            this.year = year
+                        }
+                    }
+            )
+        }.distinctBy { it.url }
+
+
+
+        val data = HashMap<String, Any>()
+        val server = ArrayList<Map<String, String>>()
+
+        data["id"] = id
+        data["favs"] = document.selectFirst("input#ctrl_favs")?.attr("value").orEmpty()
+        data["ref"] = resolved
+
+        return if (tvType == TvType.TvSeries) {
+            // Series-only: movies keep the branch below untouched.
+            val translators = document.select("#translators-list li, #translators-list a")
+            if (translators.isNotEmpty()) {
+                translators.forEach { res ->
+                    val node = if (res.tagName() == "li") {
+                        res.selectFirst("a") ?: res
+                    } else {
+                        res
+                    }
+
+                    val tid = node.attr("data-translator_id")
+                    if (tid.isBlank()) return@forEach
+                    server.add(
+                        mapOf(
+                            "translator_name" to res.text().trim(),
+                            "translator_id" to tid,
+                        )
+                    )
+                }
+            } else {
+                document.select("script").forEach { script ->
+                    val match = Regex(
+                        """initCDNSeriesEvents\(\d+,\s*(\d+)"""
+                    ).find(script.data())
+                    if (match != null) {
+                        server.add(
+                            mapOf(
+                                "translator_name" to "HDrezka",
+                                "translator_id" to match.groupValues[1],
+                            )
+                        )
+                    }
+                }
+            }
+
+            // Site uses <a class="b-simple_episode__item">, not <ul><li> — old
+            // "ul li" selector returned 0 episodes for Simpsons / long-running shows.
+            val episodeKeys = LinkedHashSet<Pair<Int, Int>>()
+            collectEpisodePairs(document).forEach { episodeKeys += it }
+            // Initial DOM often only has the latest seasons for the default voiceover.
+            // get_episodes expands the full S×E grid for a translator (e.g. 2x2 → S1…).
+            expandSeriesEpisodes(id, data["favs"] as String, resolved, server, episodeKeys)
+
+            val episodes = episodeKeys.sortedWith(compareBy({ it.first }, { it.second })).map { (season, episode) ->
+                val episodeData = HashMap<String, Any>(data).apply {
+                    this["season"] = "$season"
+                    this["episode"] = "$episode"
+                    this["server"] = server
+                    this["action"] = "get_stream"
+                }
+                newEpisode(episodeData.toJson(), {
+                    this.name = "Episode $episode"
+                    this.season = season
+                    this.episode = episode
+                }, fix = false)
+            }
+            Log.i(
+                "HDrezka",
+                "load series id=$id host=$mainUrl translators=${server.size} episodes=${episodes.size} " +
+                    "seasons=${episodeKeys.map { it.first }.toSet().sorted()} anubisLeft=${isAnubisChallenge(document.html())}",
+            )
+
+            newTvSeriesLoadResponse(title, resolved, TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.year = year
+                this.plot = description
+                this.tags = tags
+                this.score = Score.from10(rating)
+                addActors(actors)
+                this.recommendations = recommendations
+                addTrailer(trailer)
+            }
+        } else {
+            val translators = document.select("#translators-list li, #translators-list a")
+
+            translators.forEach { el ->
+                val node = if (el.tagName() == "li") {
+                    el.selectFirst("a") ?: el
+                } else {
+                    el
+                }
+
+                val tid = node.attr("data-translator_id")
+                if (tid.isBlank()) return@forEach
+
+                server.add(
+                    mapOf(
+                        "translator_name" to node.text().trim(),
+                        "translator_id" to tid,
+                        "camrip" to node.attr("data-camrip"),
+                        "ads" to node.attr("data-ads"),
+                        "director" to node.attr("data-director"),
+                    )
+                )
+            }
+
+            data["server"] = server
+            data["action"] = "get_movie"
+            Log.i(
+                "HDrezka",
+                "load movie id=$id host=$mainUrl translators=${server.size} anubisLeft=${isAnubisChallenge(document.html())}",
+            )
+
+            newMovieLoadResponse(title, resolved, TvType.Movie, data.toJson()) {
+                this.posterUrl = poster
+                this.year = year
+                this.plot = description
+                this.tags = tags
+                this.score = Score.from10(rating)
+                addActors(actors)
+                this.recommendations = recommendations
+                addTrailer(trailer)
+            }
+        }
+    }
+
+    /** Episode nodes on series pages (anchors or list items). */
+    private fun collectEpisodePairs(root: org.jsoup.nodes.Element): List<Pair<Int, Int>> {
+        return root.select(
+            "div#simple-episodes-tabs a.b-simple_episode__item, " +
+                "div#simple-episodes-tabs li.b-simple_episode__item, " +
+                "ul.b-simple_episodes__list [data-season_id][data-episode_id], " +
+                "[data-season_id][data-episode_id]"
+        ).mapNotNull { el ->
+            val season = el.attr("data-season_id").toIntOrNull() ?: return@mapNotNull null
+            val episode = el.attr("data-episode_id").toIntOrNull() ?: return@mapNotNull null
+            season to episode
+        }
+    }
+
+    /**
+     * Long-running series only ship the latest seasons in the first HTML.
+     * Merge episode grids from get_episodes across voiceovers until season 1
+     * appears (or a few translators were tried). Movie path never calls this.
+     */
+    private suspend fun expandSeriesEpisodes(
+        id: String,
+        favs: String,
+        referer: String,
+        translators: List<Map<String, String>>,
+        into: LinkedHashSet<Pair<Int, Int>>,
+    ) {
+        if (translators.isEmpty()) return
+        val before = into.size
+        for (tr in translators.take(6)) {
+            val tid = tr["translator_id"] ?: continue
+            try {
+                val ajax = tryParseJson<EpisodesAjax>(
+                    postText(
+                        url = "$mainUrl/ajax/get_cdn_series/?t=${Date().time}",
+                        data = mapOf(
+                            "id" to id,
+                            "translator_id" to tid,
+                            "favs" to favs,
+                            "season" to "1",
+                            "action" to "get_episodes",
+                        ),
+                        referer = referer,
+                    )
+                ) ?: continue
+                if (ajax.success == false) continue
+                val html = buildString {
+                    append(ajax.episodes.orEmpty())
+                    append(ajax.seasons.orEmpty())
+                }
+                if (html.isBlank()) continue
+                collectEpisodePairs(Jsoup.parse(html)).forEach { into += it }
+            } catch (t: Throwable) {
+                Log.w("HDrezka", "get_episodes failed tr=$tid: ${t.message}")
+            }
+            // Early seasons present → catalog S1/S2 lookups will work.
+            if (into.any { it.first == 1 }) break
+        }
+        Log.i("HDrezka", "expand episodes $before → ${into.size}")
+    }
+
+    private fun decryptStreamUrl(data: String): String {
+        // Newer mirrors sometimes return cleartext "[720p]https://... ,[1080p]https://..."
+        // instead of the legacy #h / //_// trash-encoded blob.
+        val trimmed = data.trim()
+        if (trimmed.contains("[") && trimmed.contains("http") && !trimmed.contains("#h")) {
+            return trimmed.replace("\\/", "/")
+        }
+
+        fun getTrash(arr: List<String>, item: Int): List<String> {
+            val trash = ArrayList<List<String>>()
+            for (i in 1..item) {
+                trash.add(arr)
+            }
+            return trash.reduce { acc, list ->
+                val temp = ArrayList<String>()
+                acc.forEach { ac ->
+                    list.forEach { li ->
+                        temp.add(ac.plus(li))
+                    }
+                }
+                return@reduce temp
+            }
+        }
+
+        val trashList = listOf("@", "#", "!", "^", "$")
+        val trashSet = getTrash(trashList, 2) + getTrash(trashList, 3)
+        var trashString = data.replace("#h", "").split("//_//").joinToString("")
+
+        trashSet.forEach {
+            val temp = base64Encode(it.toByteArray())
+            trashString = trashString.replace(temp, "")
+        }
+
+        return try {
+            base64Decode(trashString)
+        } catch (_: Exception) {
+            // Last resort: treat as cleartext if decode fails
+            trimmed.replace("\\/", "/")
+        }
+    }
+
+    private suspend fun cleanCallback(
+        source: String,
+        url: String,
+        quality: String,
+        isM3u8: Boolean,
+        sourceCallback: (ExtractorLink) -> Unit
+    ) {
+        sourceCallback.invoke(
+            newExtractorLink(
+                source,
+                source,
+                url,
+                if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.referer = "$mainUrl/"
+                this.quality = getQuality(quality)
+                this.headers = mapOf(
+                    "Origin" to mainUrl
+                )
+            }
+        )
+    }
+
+    private fun getLanguage(str: String): String {
+        return when (str) {
+            "Русский" -> "Russian"
+            "Українська" -> "Ukrainian"
+            else -> str
+        }
+    }
+
+    private fun getQuality(str: String): Int {
+        return when (str) {
+            "360p" -> Qualities.P240.value
+            "480p" -> Qualities.P360.value
+            "720p" -> Qualities.P480.value
+            "1080p" -> Qualities.P720.value
+            "1080p Ultra" -> Qualities.P1080.value
+            else -> getQualityFromName(str)
+        }
+    }
+
+    private suspend fun invokeSources(
+        source: String,
+        url: String,
+        subtitle: String,
+        subCallback: (SubtitleFile) -> Unit,
+        sourceCallback: (ExtractorLink) -> Unit
+    ) {
+        for (links in decryptStreamUrl(url).split(",")) {
+            val quality =
+                Regex("\\[([0-9]{3,4}p\\s?\\w*?)]").find(links)?.groupValues?.getOrNull(1)
+                    ?.trim() ?: continue
+            for (raw in links.replace("[$quality]", "").split(" or ")) {
+                val link = raw.trim()
+                val type = if (link.contains(".m3u8")) "Main" else "Backup"
+                // "Studio • 1080p (Main)" — voiceover picker parses studio before quality
+                cleanCallback(
+                    "$source • $quality ($type)",
+                    link,
+                    quality,
+                    link.contains(".m3u8"),
+                    sourceCallback,
+                )
+            }
+        }
+
+        for (sub in subtitle.split(",")) {
+            val language =
+                Regex("\\[(.*)]").find(sub)?.groupValues?.getOrNull(1) ?: continue
+            val link = sub.replace("[$language]", "").trim()
+            subCallback.invoke(
+                newSubtitleFile(
+                    getLanguage(language),
+                    link
+                )
+            )
+        }
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        ensureWorkingMirror()
+
+        tryParseJson<Data>(data)?.let { res ->
+            if (res.server?.isEmpty() == true) {
+                val document = fetchDocument(res.ref ?: return@let)
+                document.select("script").map { script ->
+                    if (script.data().contains("sof.tv.initCDNMoviesEvents(")) {
+                        val dataJson =
+                            script.data().substringAfter("false, {").substringBefore("});")
+                        tryParseJson<LocalSources>("{$dataJson}")?.let { source ->
+                            invokeSources(
+                                this.name,
+                                source.streams,
+                                source.subtitle.toString(),
+                                subtitleCallback,
+                                callback
+                            )
+                        }
+                    }
+                }
+            } else {
+                res.server?.amap { server ->
+                    tryParseJson<Sources>(
+                        postText(
+                            url = "$mainUrl/ajax/get_cdn_series/?t=${Date().time}",
+                            data = mapOf(
+                                "id" to res.id,
+                                "translator_id" to server.translator_id,
+                                "favs" to res.favs,
+                                "is_camrip" to server.camrip,
+                                "is_ads" to server.ads,
+                                "is_director" to server.director,
+                                "season" to res.season,
+                                "episode" to res.episode,
+                                "action" to res.action,
+                            ).filterValues { it != null }.mapValues { it.value as String },
+                            referer = res.ref
+                        )
+                    )?.let { source ->
+                        invokeSources(
+                            server.translator_name.toString(),
+                            source.url,
+                            source.subtitle.toString(),
+                            subtitleCallback,
+                            callback
+                        )
+                    }
+                }
+            }
+        }
+
+        return true
+    }
+
+    data class EpisodesAjax(
+        @JsonProperty("success") val success: Boolean? = null,
+        @JsonProperty("episodes") val episodes: String? = null,
+        @JsonProperty("seasons") val seasons: String? = null,
+        @JsonProperty("message") val message: String? = null,
+    )
+
+    data class LocalSources(
+        @JsonProperty("streams") val streams: String,
+        @JsonProperty("subtitle") val subtitle: Any?,
+    )
+
+    data class Sources(
+        @JsonProperty("url") val url: String,
+        @JsonProperty("subtitle") val subtitle: Any?,
+    )
+
+    data class Server(
+        @JsonProperty("translator_name") val translator_name: String?,
+        @JsonProperty("translator_id") val translator_id: String?,
+        @JsonProperty("camrip") val camrip: String?,
+        @JsonProperty("ads") val ads: String?,
+        @JsonProperty("director") val director: String?,
+    )
+
+    data class Data(
+        @JsonProperty("id") val id: String?,
+        @JsonProperty("favs") val favs: String?,
+        @JsonProperty("server") val server: List<Server>?,
+        @JsonProperty("season") val season: String?,
+        @JsonProperty("episode") val episode: String?,
+        @JsonProperty("action") val action: String?,
+        @JsonProperty("ref") val ref: String?,
+    )
+
+    data class Trailer(
+        @JsonProperty("success") val success: Boolean?,
+        @JsonProperty("code") val code: String?,
+    )
+
+    data class AnubisPayload(
+        @JsonProperty("rules") val rules: AnubisRules? = null,
+        @JsonProperty("challenge") val challenge: AnubisChallenge? = null,
+    )
+
+    data class AnubisRules(
+        @JsonProperty("algorithm") val algorithm: String? = null,
+        @JsonProperty("difficulty") val difficulty: Int? = null,
+    )
+
+    data class AnubisChallenge(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("randomData") val randomData: String? = null,
+        @JsonProperty("difficulty") val difficulty: Int? = null,
+        @JsonProperty("method") val method: String? = null,
+    )
+}
